@@ -779,3 +779,38 @@ fn assert_independent_recordings(preview: bool) {
         );
     }
 }
+
+#[test]
+fn lf_only_stream_uses_verified_plan_without_line_records() {
+    let (output, statistics) =
+        format_with_statistics(&"\n".repeat(262_144), "[format]\n");
+    assert_eq!(output, "");
+    assert_eq!(statistics["fallback"], Value::Null, "{statistics}");
+    assert_eq!(statistics["verification_parses"], 1, "{statistics}");
+    assert_eq!(statistics["planning_invocations"], 2, "{statistics}");
+    assert_eq!(statistics["line_table_builds"], 0, "{statistics}");
+    assert_eq!(statistics["emissions"], 1, "{statistics}");
+}
+
+#[test]
+fn empty_stream_has_no_pending_plan() {
+    let (output, statistics) = format_with_statistics("", "[format]\n");
+    assert_eq!(output, "");
+    assert_eq!(statistics["fallback"], Value::Null, "{statistics}");
+    assert_eq!(statistics["emissions"], 0, "{statistics}");
+}
+
+#[test]
+fn non_lf_whitespace_keeps_the_fallback() {
+    let (output, statistics) = format_with_statistics(" \n\t\n", "[format]\n");
+    assert_eq!(output, "");
+    assert_ne!(statistics["fallback"], Value::Null, "{statistics}");
+}
+
+#[test]
+fn empty_stream_collection_conversion_keeps_the_fallback() {
+    let (output, statistics) =
+        format_with_statistics("\n\n", "[format]\nsequence-style = \"flow\"\n");
+    assert_eq!(output, "");
+    assert_ne!(statistics["fallback"], Value::Null, "{statistics}");
+}

@@ -68,6 +68,67 @@ enum Sink {
     Validate,
 }
 
+type PreparedOutput = (String, Vec<(usize, ScalarStyle)>, Vec<&'static str>);
+
+struct PreparedPlan<'a> {
+    input: Analysis<'a>,
+    document: Option<DocumentPlan<'a>>,
+}
+
+impl<'a> PreparedPlan<'a> {
+    fn new(
+        input: Analysis<'a>,
+        passes: &Passes<'_>,
+        quotes: &mut HashMap<String, Option<bool>>,
+        sink: Sink,
+    ) -> Result<Self, Fallback> {
+        let text = input.text().as_bytes();
+        if (text.is_empty() || text[0] == b'\n')
+            && passes.collection_style.is_none()
+            && passes.per_line.is_empty()
+            && passes
+                .empty_lines
+                .is_some_and(|cfg| cfg.max_start() == 0 && cfg.max_end() == 0)
+            && text.iter().all(|&byte| byte == b'\n')
+        {
+            stats::count(stats::Counter::Plan);
+            return Ok(Self {
+                input,
+                document: None,
+            });
+        }
+        DocumentPlan::new(input, passes, quotes, sink).map(|document| Self {
+            input,
+            document: Some(document),
+        })
+    }
+
+    fn dirty(&self) -> bool {
+        self.document
+            .as_ref()
+            .map_or_else(|| !self.input.text().is_empty(), |plan| plan.dirty)
+    }
+
+    fn consistent(&self, cfg: &indentation::Config) -> bool {
+        self.document
+            .as_ref()
+            .is_none_or(|plan| plan.layout.consistent(cfg))
+    }
+
+    fn kept(&self) -> Vec<(usize, usize)> {
+        self.document
+            .as_ref()
+            .map_or_else(Vec::new, |plan| plan.layout.kept_dash_lines.clone())
+    }
+
+    fn emit(self) -> Result<PreparedOutput, Fallback> {
+        match self.document {
+            None => Ok((String::new(), Vec::new(), vec![empty_lines::ID])),
+            Some(plan) => plan.emit().map(|text| (text, plan.styles, plan.rules)),
+        }
+    }
+}
+
 pub(crate) fn format(
     source: &mut TextVersion<'_>,
     passes: &Passes<'_>,
@@ -75,21 +136,19 @@ pub(crate) fn format(
 ) -> Result<TextVersion<'static>, Fallback> {
     let mut quotes = HashMap::new();
     let (prepared, kept) =
-        DocumentPlan::new(source.analysis(), passes, &mut quotes, Sink::Emit)
+        PreparedPlan::new(source.analysis(), passes, &mut quotes, Sink::Emit)
             .and_then(|plan| {
-                let consistent = plan.dirty
+                let consistent = plan.dirty()
                     || !passes.indentation.is_some_and(|cfg| {
-                        cfg.requires_consistency() && !plan.layout.consistent(&cfg)
+                        cfg.requires_consistency() && !plan.consistent(&cfg)
                     });
-                let kept = plan.layout.kept_dash_lines.clone();
+                let kept = plan.kept();
                 consistent
                     .then_some(())
                     .ok_or(Fallback::Refusal)
                     .and_then(|()| {
-                        plan.dirty
-                            .then(|| {
-                                plan.emit().map(|text| (text, plan.styles, plan.rules))
-                            })
+                        plan.dirty()
+                            .then(|| plan.emit())
                             .transpose()
                             .map(|prepared| (prepared, kept))
                     })
@@ -129,27 +188,22 @@ pub(crate) fn format(
     }
     output.mark_strict_valid();
     source.take_facts();
-    let dry = DocumentPlan::new(output.analysis(), passes, &mut quotes, Sink::Validate)
+    let dry = PreparedPlan::new(output.analysis(), passes, &mut quotes, Sink::Validate)
         .inspect_err(|_| {
             stats::count(stats::Counter::Rollback);
         })?;
-    if dry.dirty {
+    if dry.dirty() {
         stats::count(stats::Counter::Rollback);
         return Err(Fallback::DryEdits);
     }
     if let Some(cfg) = passes.indentation
         && cfg.requires_consistency()
-        && !dry.layout.consistent(&cfg)
+        && !dry.consistent(&cfg)
     {
         stats::count(stats::Counter::Rollback);
         return Err(Fallback::Refusal);
     }
-    remember(
-        tracking,
-        &output,
-        passes.indentation,
-        dry.layout.kept_dash_lines.clone(),
-    );
+    remember(tracking, &output, passes.indentation, dry.kept());
     drop(dry);
     output.release_tokens();
     tracking.edited.extend(rules);
